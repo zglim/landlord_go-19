@@ -5,192 +5,252 @@ import (
 	"landlord_go/proto"
 	"landlord_go/svc/agent/api"
 	"landlord_go/svc/game/database"
-	"sort"
 )
 
-//群发ChatMsgResponse消息，群发InitHallResponse更新大厅状态
+// ---------------------------------------------------------------------------
+// 登录：处理重复登录、清理旧会话、初始化大厅
+// ---------------------------------------------------------------------------
 func Login(req *LoginRequest, cid *proto.ClientID) {
 	if req.UserName == "" || req.Password == "" {
 		log.Errorln("username or password invalid")
 		return
 	}
-	player := &Player{Cid:cid,UserName:req.UserName}
+
+	// 清理同一 UserName 的旧会话（断线重连场景）
+	if oldVal, loaded := userName2Player.Load(req.UserName); loaded {
+		oldPlayer := oldVal.(*Player)
+		if oldPlayer.Cid != nil {
+			clientID2Player.Delete(oldPlayer.Cid.ID)
+		}
+		if oldPlayer.SeatNum > 0 {
+			playerMap.Delete(oldPlayer.SeatNum)
+		}
+	}
+	// 清理同一 cid 的旧会话
+	if oldVal, loaded := clientID2Player.Load(cid.ID); loaded {
+		oldPlayer := oldVal.(*Player)
+		if oldPlayer.UserName != "" {
+			userName2Player.Delete(oldPlayer.UserName)
+		}
+	}
+
+	player := &Player{Cid: cid, UserName: req.UserName}
 	clientID2Player.Store(cid.ID, player)
 	userName2Player.Store(req.UserName, player)
-	chat := &ChatMsgResponse{ChatFlag:1, UserName:req.UserName,
-		Msg:req.UserName + "骑着母猪大摇大摆溜进游戏室！", TableNum:-1}
+
+	// 群发进场聊天
+	chat := &ChatMsgResponse{ChatFlag: 1, UserName: req.UserName,
+		Msg: req.UserName + "骑着母猪大摇大摆溜进游戏室！", TableNum: -1}
 	data, _ := json.Marshal(chat)
-	agentapi.BroadcastAll(&proto.JsonACK{JsonType:102, Content:data})
-	init := new(InitHallResponse)
-	tableMap.Range(func(key, value interface{}) bool {
-		players := value.(*Table).Players
-		var userNames []string
-		for _, v := range players {
-			if v != nil {
-				userNames = append(userNames, v.UserName)
-			}
-		}
-		hallList[key.(int32)-1]=&HallTable{key.(int32), userNames,
-			value.(*Table).IsPlay, value.(*Table).PlayerCount == 3}
-		return true
-	})
-	sort.Sort(hallList) //从syncMap取出来的集合是无序的，需要排序
-	init.HallTables = hallList
+	agentapi.BroadcastAll(&proto.JsonACK{JsonType: 102, Content: data})
+
+	// 发送大厅初始化状态（从 tableMap 实时重建，避免增量 drift）
+	hallList = buildHallList()
+	init := &InitHallResponse{HallTables: hallList}
 	data, _ = json.Marshal(init)
-	agentapi.Send(cid, &proto.JsonACK{JsonType:109, Content:data})
+	agentapi.Send(cid, &proto.JsonACK{JsonType: 109, Content: data})
 }
 
-//反馈InitHallResponse，获取大厅初始化状态
+// ---------------------------------------------------------------------------
+// 大厅初始化：安全遍历，nil 保护
+// ---------------------------------------------------------------------------
 func InitHall(_ *InitHallRequest, cid *proto.ClientID) {
-	init := new(InitHallResponse)
-	tableMap.Range(func(key, value interface{}) bool {
-		players := value.(*Table).Players
-		var userNames []string
-		for _, v := range players {
-			userNames = append(userNames, v.UserName)
-		}
-		hallList[key.(int32)-1]=&HallTable{key.(int32), userNames,
-			value.(*Table).IsPlay, value.(*Table).PlayerCount == 3}
-		return true
-	})
-	sort.Sort(hallList)
-	init.HallTables = hallList
+	hallList = buildHallList()
+	init := &InitHallResponse{HallTables: hallList}
 	data, _ := json.Marshal(init)
-	agentapi.Send(cid, &proto.JsonACK{JsonType:109, Content:data})
+	agentapi.Send(cid, &proto.JsonACK{JsonType: 109, Content: data})
 }
 
-//进入牌桌后反馈成功信息，更新容器信息，在线群发RefreshHallResponse更新大厅信息；如果人满了则反馈进入牌桌失败
+// ---------------------------------------------------------------------------
+// 进桌：nil 保护 + 重复进桌拦截 + 大厅原子重建
+// ---------------------------------------------------------------------------
 func EnterTable(req *EnterTableRequest, cid *proto.ClientID) {
-	value1, _ := tableMap.Load(req.TableNum)
-	table := value1.(*Table)
-	value2, _ := clientID2Player.Load(cid.ID)
-	player := value2.(*Player)
-	playerCount := table.PlayerCount
-	if playerCount < 3 {
-		player.TableNum = req.TableNum
-		newSeatNum := GetSeatNum(req.TableNum, playerCount)
-		player.SeatNum = newSeatNum
-		playerMap.Store(newSeatNum, player)
-		table.Players = append(table.Players, player)
-		table.PlayerCount = playerCount + 1
-		table.Cards = GetRandomCards()
-		table.TableNum = req.TableNum
-		userName2Player.Store(req.UserName, player)
-		tablePlayers := RefreshSeatNum2UserName(table)
-		enterTable := &EnterTableResponse{true, tablePlayers}
-		data, _ := json.Marshal(enterTable)
-		WrapMultiSend(table.Players, &proto.JsonACK{JsonType:105, Content:data}, nil)
-		for _, v := range hallList {
-			if v.TableNum == table.TableNum {
-				v.UserNames = append(v.UserNames, req.UserName)
-				v.IsPlay = false
-				v.IsFull = len(v.UserNames) == 3
-			}
-		}
-		sort.Sort(hallList)
-		refreshHall := &RefreshHallResponse{hallList}
-		data, _ = json.Marshal(refreshHall)
-		var players []*Player
-		userName2Player.Range(func(key, value interface{}) bool {
-			players = append(players, value.(*Player))
-			return true
-		})
-		WrapMultiSend(players, &proto.JsonACK{JsonType:114, Content:data}, cid)
-	} else {
+	table := loadTable(req.TableNum)
+	if table == nil {
+		log.Errorf("EnterTable: table %d not found", req.TableNum)
+		return
+	}
+	player := loadPlayer(cid)
+	if player == nil {
+		log.Errorf("EnterTable: player for cid %d not found", cid.ID)
+		return
+	}
+
+	// 已在桌内则拒绝重复进桌
+	if player.TableNum > 0 {
+		log.Errorf("EnterTable: player %s already at table %d", player.UserName, player.TableNum)
 		enterTable := &EnterTableResponse{false, nil}
 		data, _ := json.Marshal(enterTable)
-		agentapi.Send(cid, &proto.JsonACK{JsonType:105, Content:data})
+		agentapi.Send(cid, &proto.JsonACK{JsonType: 105, Content: data})
+		return
 	}
+
+	if table.PlayerCount >= 3 {
+		enterTable := &EnterTableResponse{false, nil}
+		data, _ := json.Marshal(enterTable)
+		agentapi.Send(cid, &proto.JsonACK{JsonType: 105, Content: data})
+		return
+	}
+
+	// 分配座位并入桌
+	player.TableNum = req.TableNum
+	newSeatNum := GetSeatNum(req.TableNum, table.PlayerCount)
+	player.SeatNum = newSeatNum
+	playerMap.Store(newSeatNum, player)
+	table.Players = append(table.Players, player)
+	table.PlayerCount++
+	table.Cards = GetRandomCards()
+	table.TableNum = req.TableNum
+
+	// 通知桌内玩家
+	tablePlayers := RefreshSeatNum2UserName(table)
+	enterTable := &EnterTableResponse{true, tablePlayers}
+	data, _ := json.Marshal(enterTable)
+	WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 105, Content: data}, nil)
+
+	// 重建大厅并广播给所有在线玩家（含自己）
+	BroadcastHallRefresh()
 }
 
-//转发聊天信息
-func ChatMsg(req *ChatMsgRequest, _ *proto.ClientID) {
-	chatMsg := &ChatMsgResponse{req.ChatFlag, req.UserName, req.Msg,
-		req.TableNum}
+// ---------------------------------------------------------------------------
+// 聊天：修复 ChatFlag==2 时错误地把 *Table 当 *Player 的 bug
+// ---------------------------------------------------------------------------
+func ChatMsg(req *ChatMsgRequest, cid *proto.ClientID) {
+	chatMsg := &ChatMsgResponse{req.ChatFlag, req.UserName, req.Msg, req.TableNum}
 	data, _ := json.Marshal(chatMsg)
+
 	var players []*Player
 	if req.ChatFlag == 1 {
+		// 全服聊天
 		userName2Player.Range(func(key, value interface{}) bool {
-			players = append(players, value.(*Player))
+			if p := value.(*Player); p != nil && p.Cid != nil {
+				players = append(players, p)
+			}
 			return true
 		})
+	} else if req.ChatFlag == 2 {
+		// 桌内聊天：根据发送者找到其所在桌
+		player := loadPlayer(cid)
+		if player == nil || player.TableNum == 0 {
+			return
+		}
+		table := loadTable(player.TableNum)
+		if table == nil {
+			return
+		}
+		players = table.Players
 	}
-	if req.ChatFlag == 2 {
-		tableMap.Range(func(key, value interface{}) bool {
-			players = append(players, value.(*Player))
-			return true
-		})
-	}
-	WrapMultiSend(players, &proto.JsonACK{JsonType:102, Content:data}, nil)
+	WrapMultiSend(players, &proto.JsonACK{JsonType: 102, Content: data}, nil)
 }
 
-//接受准备信息，满3开始游戏
+// ---------------------------------------------------------------------------
+// 准备：nil 保护 + 重复准备拦截 + 开局重置 ReadyFlag
+// ---------------------------------------------------------------------------
 func Ready(req *ReadyRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
+	// 防止重复准备
+	if player.ReadyFlag {
+		return
+	}
+	player.ReadyFlag = true
 	table.ReadyCount++
+
 	if req.IsReady {
 		readyResponse := &ReadyResponse{true}
 		data, _ := json.Marshal(readyResponse)
-		agentapi.Send(cid, &proto.JsonACK{JsonType:113, Content:data})
+		agentapi.Send(cid, &proto.JsonACK{JsonType: 113, Content: data})
 	}
-	if table.ReadyCount == 3 {
+
+	if table.ReadyCount >= 3 {
 		table.IsWait = false
 		table.IsGrab = true
 		log.Infoln("房间当前准备人数：", table.ReadyCount)
+
 		totalCards := table.Cards
 		cardsMap := make(map[int32][]int32)
 		cardsMap[0] = totalCards[:17]
 		cardsMap[1] = totalCards[17:34]
 		cardsMap[2] = totalCards[34:51]
-		var threeCards []int32
-		threeCards = append(threeCards, totalCards[51])
-		threeCards = append(threeCards, totalCards[52])
-		threeCards = append(threeCards, totalCards[53])
+		threeCards := []int32{totalCards[51], totalCards[52], totalCards[53]}
 		table.ThreeCards = threeCards
+
 		landlordNum := GetRandomLandlord(table.TableNum)
 		var index int32 = 0
-		log.Infoln("table.Players: ", table.Players)
 		for _, v := range table.Players {
+			if v == nil {
+				continue
+			}
 			table.PlayersCardsOut[v.SeatNum] = 17
 			grabLandlord := &GrabLandlordResponse{landlordNum,
 				RefreshSeatNum2UserName(table), threeCards, cardsMap[index]}
 			data, _ := json.Marshal(grabLandlord)
-			agentapi.Send(v.Cid, &proto.JsonACK{JsonType:108, Content:data})
+			agentapi.Send(v.Cid, &proto.JsonACK{JsonType: 108, Content: data})
 			index++
+			v.ReadyFlag = false // 新一局重置准备状态
 		}
 		table.ReadyCount = 0
 	}
 }
 
-//接受取消准备信息
+// ---------------------------------------------------------------------------
+// 取消准备：nil 保护 + 重复取消拦截 + ReadyCount 不下溢
+// ---------------------------------------------------------------------------
 func CancelReady(req *CancelReadyRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
+	// 防止重复取消 / 计数下溢
+	if !player.ReadyFlag {
+		return
+	}
+	player.ReadyFlag = false
 	table.ReadyCount--
+	if table.ReadyCount < 0 {
+		table.ReadyCount = 0
+	}
+
 	if req.IsCancelReady {
 		cancelReady := &CancelReadyResponse{true}
 		data, _ := json.Marshal(cancelReady)
-		agentapi.Send(cid, &proto.JsonACK{JsonType:100,Content:data})
+		agentapi.Send(cid, &proto.JsonACK{JsonType: 100, Content: data})
 	}
 }
 
-//接受放弃抢地主信息
+// ---------------------------------------------------------------------------
+// 放弃抢地主
+// ---------------------------------------------------------------------------
 func GiveUpLandlord(req *GiveUpLandlordRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
 	table.PassLandlordCount++
 	log.Infoln("累计放弃地主次数：", table.PassLandlordCount)
+
 	giveUpLandlord := &GiveUpLandlordResponse{GetRightRivalSeatNum(req.SeatNum, table.Players)}
 	data, _ := json.Marshal(giveUpLandlord)
-	WrapMultiSend(table.Players, &proto.JsonACK{JsonType:107,Content:data}, nil)
-	if table.PassLandlordCount == 3 {
+	WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 107, Content: data}, nil)
+
+	if table.PassLandlordCount >= 3 {
 		log.Infoln("三次扔地主自动结束抢地主")
 		table.PassLandlordCount = 0
 		landlord := GetRightRivalSeatNum(req.SeatNum, table.Players)
@@ -199,94 +259,122 @@ func GiveUpLandlord(req *GiveUpLandlordRequest, cid *proto.ClientID) {
 				table.PlayersCardsOut[k] = 20
 			}
 		}
-		endGrabLandlord := &EndGrabLandlordResponse{landlord,table.ThreeCards}
+		endGrabLandlord := &EndGrabLandlordResponse{landlord, table.ThreeCards}
 		data, _ = json.Marshal(endGrabLandlord)
-		WrapMultiSend(table.Players, &proto.JsonACK{JsonType:104,Content:data}, nil)
+		WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 104, Content: data}, nil)
 	}
 }
 
-//抢地主跳转加倍
+// ---------------------------------------------------------------------------
+// 抢地主跳转加倍
+// ---------------------------------------------------------------------------
 func EndGrabLandlord(req *EndGrabLandlordRequest, cid *proto.ClientID) {
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
 	landlord := req.MeSeatNum
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
 	for k := range table.PlayersCardsOut {
 		if k == landlord {
 			table.PlayersCardsOut[k] = 20
 		}
 	}
-	endGrabLandlord := &EndGrabLandlordResponse{landlord,table.ThreeCards}
+	endGrabLandlord := &EndGrabLandlordResponse{landlord, table.ThreeCards}
 	data, _ := json.Marshal(endGrabLandlord)
-	WrapMultiSend(table.Players, &proto.JsonACK{JsonType:104,Content:data}, nil)
+	WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 104, Content: data}, nil)
 }
 
-//加倍请求
+// ---------------------------------------------------------------------------
+// 加倍请求
+// ---------------------------------------------------------------------------
 func LandlordMultipleWager(req *LandlordMultipleWagerRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
 	table.WagerMultipleNum = req.MultipleNum
 	if req.MultipleNum == 1 {
 		multipleWager := &MultipleWagerResponse{1}
 		data, _ := json.Marshal(multipleWager)
-		WrapMultiSend(table.Players, &proto.JsonACK{JsonType:112,Content:data}, nil)
+		WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 112, Content: data}, nil)
 	} else {
 		landlordMultipleWager := &LandlordMultipleWagerResponse{req.MultipleNum}
 		data, _ := json.Marshal(landlordMultipleWager)
-		WrapMultiSend(table.Players, &proto.JsonACK{JsonType:110,Content:data}, cid)
+		WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 110, Content: data}, cid)
 	}
 }
 
-//加倍应答
+// ---------------------------------------------------------------------------
+// 加倍应答
+// ---------------------------------------------------------------------------
 func MultipleWager(req *MultipleWagerRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
 	table.AnswerMultipleNum++
 	table.AgreedMultipleResult += req.Agreed
-	var multipleWager1 *MultipleWagerResponse
-	if table.AnswerMultipleNum == 2 {
-		if table.AgreedMultipleResult < 2 {
-			multipleWager1 = &MultipleWagerResponse{1}
-		} else {
-			multipleWager1 = &MultipleWagerResponse{table.WagerMultipleNum}
+
+	if table.AnswerMultipleNum >= 2 {
+		var result int32 = 1
+		if table.AgreedMultipleResult >= 2 {
+			result = table.WagerMultipleNum
 		}
-		data, _ := json.Marshal(multipleWager1)
-		WrapMultiSend(table.Players, &proto.JsonACK{JsonType:112,Content:data}, nil)
+		multipleWager := &MultipleWagerResponse{result}
+		data, _ := json.Marshal(multipleWager)
+		WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 112, Content: data}, nil)
 		table.AgreedMultipleResult = 0
 		table.WagerMultipleNum = 1
 		table.AnswerMultipleNum = 0
 	}
 }
 
-//出牌
+// ---------------------------------------------------------------------------
+// 出牌
+// ---------------------------------------------------------------------------
 func CardsOut(req *CardsOutRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
 	var cardsOut *CardsOutResponse
 	if req.IsPass {
 		table.ContinuousPass++
 		if table.ContinuousPass >= 2 {
-			cardsOut = &CardsOutResponse{req.IsPass,true,req.FromSeatNum,
-				req.ToSeatNum,table.LastCardsOut,table.ThrowOutCards,
-				table.PlayersCardsOut}
 			table.ContinuousPass = 0
+			cardsOut = &CardsOutResponse{req.IsPass, true, req.FromSeatNum,
+				req.ToSeatNum, table.LastCardsOut, table.ThrowOutCards,
+				table.PlayersCardsOut}
 		} else {
 			cardsOut = &CardsOutResponse{req.IsPass, false, req.FromSeatNum,
-				req.ToSeatNum,table.LastCardsOut,table.ThrowOutCards,
+				req.ToSeatNum, table.LastCardsOut, table.ThrowOutCards,
 				table.PlayersCardsOut}
 		}
 	} else {
 		table.ContinuousPass = 0
 		table.LastCardsOut = req.CardsOut
 		for k := range req.CardsOut {
-			table.ThrowOutCards[req.CardsOut[k] % 20]++
+			table.ThrowOutCards[req.CardsOut[k]%20]++
 		}
 		table.PlayersCardsOut[req.FromSeatNum] -= int32(len(req.CardsOut))
 		cardsOut = &CardsOutResponse{req.IsPass, false, req.FromSeatNum,
@@ -294,120 +382,169 @@ func CardsOut(req *CardsOutRequest, cid *proto.ClientID) {
 			table.PlayersCardsOut}
 	}
 	data, _ := json.Marshal(cardsOut)
-	WrapMultiSend(table.Players, &proto.JsonACK{JsonType:101,Content:data}, nil)
+	WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 101, Content: data}, nil)
 }
 
-//结束游戏
+// ---------------------------------------------------------------------------
+// 结束游戏
+// ---------------------------------------------------------------------------
 func EndGame(req *EndGameRequest, cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
-	endGame1 := &EndGameResponse{req.WinnerSeatNum}
-	data, _ := json.Marshal(endGame1)
-	WrapMultiSend(table.Players, &proto.JsonACK{JsonType:103,Content:data},nil)
+	player := loadPlayer(cid)
+	if player == nil {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
+	endGame := &EndGameResponse{req.WinnerSeatNum}
+	data, _ := json.Marshal(endGame)
+	WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 103, Content: data}, nil)
 }
 
-//退出牌桌
+// ---------------------------------------------------------------------------
+// 退出牌桌：修复 slice 删除 + 大厅重建
+// ---------------------------------------------------------------------------
 func ExitSeat(req *ExitSeatRequest, cid *proto.ClientID) {
-	value1, _ := playerMap.Load(req.YourSeatNum)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
+	val, ok := playerMap.Load(req.YourSeatNum)
+	if !ok {
+		return
+	}
+	player := val.(*Player)
+	if player == nil || player.UserName == "" {
+		return
+	}
+	table := loadTable(player.TableNum)
+	if table == nil {
+		return
+	}
+
+	// 从桌内移除玩家（安全 slice 删除）
 	for k, v := range table.Players {
 		if v == player {
 			table.Players = append(table.Players[:k], table.Players[k+1:]...)
+			break
 		}
 	}
 	table.PlayerCount--
+	if table.PlayerCount < 0 {
+		table.PlayerCount = 0
+	}
 	table.IsPlay = false
 	table.IsGrab = false
 	table.IsWait = true
-	exitSeat1 := &ExitSeatResponse{player.UserName,req.YourSeatNum,
-		RefreshSeatNum2UserName(table)}
-	data, _ := json.Marshal(exitSeat1)
-	WrapMultiSend(table.Players, &proto.JsonACK{JsonType:106,Content:data}, cid)
-	for _, v := range hallList {
-		if v.TableNum == table.TableNum {
-			v.IsFull = false
-			v.IsPlay = false
-			for x, y := range v.UserNames {
-				if y == player.UserName {
-					v.UserNames = append(v.UserNames[:x], v.UserNames[x+1:]...)
-				}
-			}
+	// 重置桌内剩余玩家的准备状态
+	for _, v := range table.Players {
+		if v != nil {
+			v.ReadyFlag = false
 		}
 	}
+
+	exitSeat := &ExitSeatResponse{player.UserName, req.YourSeatNum,
+		RefreshSeatNum2UserName(table)}
+	data, _ := json.Marshal(exitSeat)
+	WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 106, Content: data}, cid)
+
 	playerMap.Delete(req.YourSeatNum)
-	refreshHall1 := &RefreshHallResponse{hallList}
-	data, _ = json.Marshal(refreshHall1)
-	agentapi.BroadcastAll(&proto.JsonACK{JsonType:114,Content:data})
+	player.TableNum = 0
+	player.SeatNum = 0
+
+	// 大厅重建 + 全服广播
+	BroadcastHallRefresh()
 }
 
-//退出大厅
-func ExitHall(req *ExitHallRequest, _ *proto.ClientID) {
+// ---------------------------------------------------------------------------
+// 退出大厅
+// ---------------------------------------------------------------------------
+func ExitHall(req *ExitHallRequest, cid *proto.ClientID) {
+	// 清理所有关联 map
 	userName2Player.Delete(req.UserName)
+	if cid != nil {
+		clientID2Player.Delete(cid.ID)
+	}
 }
 
-//获取个人信息
+// ---------------------------------------------------------------------------
+// 获取个人信息
+// ---------------------------------------------------------------------------
 func UserInfo(req *UserInfoRequest, cid *proto.ClientID) {
 	res, err := database.GetUserInfo(req.UserName)
 	if err != nil {
 		return
 	}
-	userInfo := &UserInfoResponse{res["name"],res["avatar"],res["win"],
-		res["lose"],res["money"]}
+	userInfo := &UserInfoResponse{res["name"], res["avatar"], res["win"],
+		res["lose"], res["money"]}
 	data, _ := json.Marshal(userInfo)
-	agentapi.Send(cid, &proto.JsonACK{JsonType:115,Content:data})
+	agentapi.Send(cid, &proto.JsonACK{JsonType: 115, Content: data})
 }
 
-//游戏结果
+// ---------------------------------------------------------------------------
+// 游戏结果
+// ---------------------------------------------------------------------------
 func GameResult(req *GameResultRequest, cid *proto.ClientID) {
-	var gameResult1 *GameResultResponse
+	var gameResult *GameResultResponse
 	if req.Result {
 		res := database.Win(req.UserName, req.Password, req.Money)
-		gameResult1 = &GameResultResponse{res}
+		gameResult = &GameResultResponse{res}
 	} else {
 		res := database.Lose(req.UserName, req.Password, req.Money)
-		gameResult1 = &GameResultResponse{res}
+		gameResult = &GameResultResponse{res}
 	}
-	data, _ := json.Marshal(gameResult1)
-	agentapi.Send(cid, &proto.JsonACK{JsonType:116,Content:data})
+	data, _ := json.Marshal(gameResult)
+	agentapi.Send(cid, &proto.JsonACK{JsonType: 116, Content: data})
 }
 
+// ---------------------------------------------------------------------------
+// 断线/异常退出：修复两处 slice 删除 bug + 大厅重建 + 全量清理
+// ---------------------------------------------------------------------------
 func ExitOrException(cid *proto.ClientID) {
-	value1, _ := clientID2Player.Load(cid.ID)
-	player := value1.(*Player)
-	value2, _ := tableMap.Load(player.TableNum)
-	table := value2.(*Table)
-	playerMap.Delete(player.SeatNum)
-	for k, v := range table.Players {
-		if v == player {
-			table.Players = append(table.Players[k:], table.Players[:k+1]...)
-		}
+	player := loadPlayer(cid)
+	if player == nil {
+		return
 	}
-	table.PlayerCount--
-	table.IsPlay = false
-	table.IsGrab = false
-	table.IsWait = true
-	exitSeat1 := &ExitSeatResponse{player.UserName,
-		player.SeatNum,RefreshSeatNum2UserName(table)}
-	data, _ := json.Marshal(exitSeat1)
-	WrapMultiSend(table.Players,&proto.JsonACK{JsonType:106,Content:data}, cid)
-	for _, v := range hallList {
-		if v.TableNum == table.TableNum {
-			v.IsFull = false
-			v.IsPlay = false
-			for x, y := range v.UserNames {
-				if y == player.UserName {
-					v.UserNames = append(v.UserNames[x:], v.UserNames[:x+1]...)
+
+	// 清理座位
+	if player.SeatNum > 0 {
+		playerMap.Delete(player.SeatNum)
+	}
+
+	// 如果在桌内，修复桌状态
+	if player.TableNum > 0 {
+		table := loadTable(player.TableNum)
+		if table != nil {
+			// 修复：原代码 append(table.Players[k:], table.Players[:k+1]...) 是错的
+			for k, v := range table.Players {
+				if v == player {
+					table.Players = append(table.Players[:k], table.Players[k+1:]...)
+					break
 				}
 			}
+			table.PlayerCount--
+			if table.PlayerCount < 0 {
+				table.PlayerCount = 0
+			}
+			table.IsPlay = false
+			table.IsGrab = false
+			table.IsWait = true
+			// 重置桌内剩余玩家的准备状态
+			for _, v := range table.Players {
+				if v != nil {
+					v.ReadyFlag = false
+				}
+			}
+
+			exitSeat := &ExitSeatResponse{player.UserName,
+				player.SeatNum, RefreshSeatNum2UserName(table)}
+			data, _ := json.Marshal(exitSeat)
+			WrapMultiSend(table.Players, &proto.JsonACK{JsonType: 106, Content: data}, cid)
 		}
 	}
-	refreshHall1 := &RefreshHallResponse{hallList}
-	data, _ = json.Marshal(refreshHall1)
-	agentapi.BroadcastAll(&proto.JsonACK{JsonType:114,Content:data})
+
+	// 大厅重建 + 全服广播
+	BroadcastHallRefresh()
+
+	// 全量清理
 	userName2Player.Delete(player.UserName)
 	clientID2Player.Delete(cid.ID)
 }

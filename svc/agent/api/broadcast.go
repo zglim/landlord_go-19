@@ -47,11 +47,11 @@ func BroadcastAll(msg interface{}) {
 
 //多客户端群发信息
 func MultipleSend(cids []*proto.ClientID, msg interface{}) {
-	if cids == nil {
+	if len(cids) == 0 {
 		return
 	}
 	agentSes := service.GetRemoteService(cids[0].SvcID)
-	ids := make([]int64, len(cids))
+	ids := make([]int64, 0, len(cids))
 	for _, v := range cids {
 		ids = append(ids, v.ID)
 	}

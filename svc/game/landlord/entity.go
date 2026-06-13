@@ -15,6 +15,7 @@ type Player struct {
 	SeatNum int32
 	Cards []int32
 	TableNum int32
+	ReadyFlag bool // 防止重复准备/取消准备
 }
 
 type Table struct {
