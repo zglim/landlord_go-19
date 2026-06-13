@@ -8,17 +8,17 @@ import (
 	"time"
 )
 
-//根据牌桌号获取座位号
+// GetSeatNum 根据牌桌号和当前人数计算下一个座位号。
 func GetSeatNum(tableNum, tablePlayerCount int32) int32 {
-	return (tableNum - 1) * 3 + tablePlayerCount + 1
+	return (tableNum-1)*3 + tablePlayerCount + 1
 }
 
-//获取随机牌，牌洗了三遍
+// GetRandomCards 洗牌（洗三遍）并返回完整的 54 张牌。
 func GetRandomCards() []int32 {
 	source := make([]int32, len(CARDS))
 	copy(source, CARDS)
 	rand.Seed(time.Now().UnixNano())
-	for i:=0; i<3; i++ {
+	for i := 0; i < 3; i++ {
 		rand.Shuffle(len(source), func(a, b int) {
 			source[a], source[b] = source[b], source[a]
 		})
@@ -26,84 +26,92 @@ func GetRandomCards() []int32 {
 	return source
 }
 
-//随机选地主
-func GetRandomLandlord(tableNum int32) int32{
-	return (tableNum - 1) * 3 + 1 + int32(rand.Float32() * 2.0)
+// GetRandomLandlord 随机选一个地主座位号（在牌桌的 3 个座位中随机选一个）。
+func GetRandomLandlord(tableNum int32) int32 {
+	return (tableNum-1)*3 + 1 + int32(rand.Float32()*2.0)
 }
 
+// GetLeftRivalSeatNum 返回左手边对手的座位号。
 func GetLeftRivalSeatNum(yourSeatNum int32, players []*Player) int32 {
-	list := make([]int32, 3)
-	for _, v := range players {
-		list = append(list, v.SeatNum)
-	}
-	maxSeatNum := max(list)
-	if maxSeatNum - yourSeatNum == 0{
+	maxSeatNum := maxSeat(players)
+	switch maxSeatNum - yourSeatNum {
+	case 0:
 		return maxSeatNum - 1
-	} else if maxSeatNum - yourSeatNum == 1 {
+	case 1:
 		return maxSeatNum - 2
-	} else {
+	default:
 		return maxSeatNum
 	}
 }
 
+// GetRightRivalSeatNum 返回右手边对手的座位号。
 func GetRightRivalSeatNum(yourSeatNum int32, players []*Player) int32 {
-	list := make([]int32, 3)
-	for _, v := range players {
-		list = append(list, v.SeatNum)
-	}
-	maxSeatNum := max(list)
-	if maxSeatNum - yourSeatNum == 0{
+	maxSeatNum := maxSeat(players)
+	switch maxSeatNum - yourSeatNum {
+	case 0:
 		return maxSeatNum - 2
-	} else if maxSeatNum - yourSeatNum == 1 {
+	case 1:
 		return maxSeatNum
-	} else {
+	default:
 		return maxSeatNum - 1
 	}
 }
 
-//返回table中的座位号-用户名map
-func RefreshSeatNum2UserName(table *Table) map[int32]string {
-	tablePlayers := make(map[int32]string)
-	for _, v := range table.Players {
-		if v != nil {
-			tablePlayers[v.SeatNum] = v.UserName
-		}
-	}
-	return tablePlayers
-}
-
-func max(a []int32) int32 {
-	var m int32
-	m = math.MinInt32
-	for _, v := range a {
-		if v > m {
-			m = v
+// SeatUserNames 返回牌桌内 座位号→用户名 的映射，用于组 EnterTable/ExitSeat/GrabLandlord 响应。
+func SeatUserNames(t *Table) map[int32]string {
+	m := make(map[int32]string, len(t.Players))
+	for _, p := range t.Players {
+		if p != nil {
+			m[p.SeatNum] = p.UserName
 		}
 	}
 	return m
 }
 
-func min(a []int32) int32 {
-	var m int32
-	m = math.MaxInt32
-	for _, v := range a {
-		if v < m {
-			m = v
+// RemovePlayerFromTable 将指定玩家从牌桌的 Players 切片中移除，并返回是否找到。
+func RemovePlayerFromTable(t *Table, target *Player) bool {
+	for i, p := range t.Players {
+		if p == target {
+			t.Players = append(t.Players[:i], t.Players[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ResetTableState 将牌桌状态重置为等待中。
+func ResetTableState(t *Table) {
+	t.IsPlay = false
+	t.IsGrab = false
+	t.IsWait = true
+}
+
+// maxSeat 返回牌桌中最大的座位号。
+func maxSeat(players []*Player) int32 {
+	var m int32 = math.MinInt32
+	for _, p := range players {
+		if p != nil && p.SeatNum > m {
+			m = p.SeatNum
 		}
 	}
 	return m
 }
 
-//群发的封装
-func WrapMultiSend(players []*Player, ack *proto.JsonACK, cid *proto.ClientID) {
+// WrapMultiSend 群发消息给 players 列表中的玩家，可排除一个客户端。
+// 修复了旧版本先访问 v.Cid 再判空的问题。
+func WrapMultiSend(players []*Player, ack *proto.JsonACK, exclude *proto.ClientID) {
 	var cids []*proto.ClientID
-	for _, v := range players {
-		if cid != nil && v.Cid.ID == cid.ID {
+	for _, p := range players {
+		if p == nil || p.Cid == nil {
 			continue
 		}
-		if v != nil {
-			cids = append(cids, v.Cid)
+		if exclude != nil && p.Cid.ID == exclude.ID {
+			continue
 		}
+		cids = append(cids, p.Cid)
+	}
+	if len(cids) == 0 {
+		return
 	}
 	agentapi.MultipleSend(cids, ack)
 }
