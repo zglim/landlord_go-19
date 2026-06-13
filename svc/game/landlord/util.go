@@ -1,24 +1,28 @@
 package landlord
 
 import (
-	"landlord_go/proto"
-	"landlord_go/svc/agent/api"
 	"math"
 	"math/rand"
 	"time"
 )
 
-//根据牌桌号获取座位号
+// Pure utility functions that do not touch global state. Anything that needs
+// to read/write sync.Maps or talk to the network belongs in errors.go,
+// broadcast.go or table.go.
+
+// GetSeatNum computes the absolute seat number for the next player joining
+// a table. Seats are globally unique across all tables.
 func GetSeatNum(tableNum, tablePlayerCount int32) int32 {
-	return (tableNum - 1) * 3 + tablePlayerCount + 1
+	return (tableNum-1)*3 + tablePlayerCount + 1
 }
 
-//获取随机牌，牌洗了三遍
+// GetRandomCards returns a shuffled deck. The deck is shuffled three times
+// to match the original behavior.
 func GetRandomCards() []int32 {
 	source := make([]int32, len(CARDS))
 	copy(source, CARDS)
 	rand.Seed(time.Now().UnixNano())
-	for i:=0; i<3; i++ {
+	for i := 0; i < 3; i++ {
 		rand.Shuffle(len(source), func(a, b int) {
 			source[a], source[b] = source[b], source[a]
 		})
@@ -26,55 +30,54 @@ func GetRandomCards() []int32 {
 	return source
 }
 
-//随机选地主
-func GetRandomLandlord(tableNum int32) int32{
-	return (tableNum - 1) * 3 + 1 + int32(rand.Float32() * 2.0)
+// GetRandomLandlord picks a random starting landlord seat within the table's
+// seat range.
+func GetRandomLandlord(tableNum int32) int32 {
+	return (tableNum-1)*3 + 1 + int32(rand.Float32()*2.0)
 }
 
+// GetLeftRivalSeatNum returns the seat number of the player sitting to the
+// left of yourSeatNum at a 3-seat table.
 func GetLeftRivalSeatNum(yourSeatNum int32, players []*Player) int32 {
-	list := make([]int32, 3)
+	list := make([]int32, 0, len(players))
 	for _, v := range players {
-		list = append(list, v.SeatNum)
-	}
-	maxSeatNum := max(list)
-	if maxSeatNum - yourSeatNum == 0{
-		return maxSeatNum - 1
-	} else if maxSeatNum - yourSeatNum == 1 {
-		return maxSeatNum - 2
-	} else {
-		return maxSeatNum
-	}
-}
-
-func GetRightRivalSeatNum(yourSeatNum int32, players []*Player) int32 {
-	list := make([]int32, 3)
-	for _, v := range players {
-		list = append(list, v.SeatNum)
-	}
-	maxSeatNum := max(list)
-	if maxSeatNum - yourSeatNum == 0{
-		return maxSeatNum - 2
-	} else if maxSeatNum - yourSeatNum == 1 {
-		return maxSeatNum
-	} else {
-		return maxSeatNum - 1
-	}
-}
-
-//返回table中的座位号-用户名map
-func RefreshSeatNum2UserName(table *Table) map[int32]string {
-	tablePlayers := make(map[int32]string)
-	for _, v := range table.Players {
 		if v != nil {
-			tablePlayers[v.SeatNum] = v.UserName
+			list = append(list, v.SeatNum)
 		}
 	}
-	return tablePlayers
+	maxSeatNum := max(list)
+	switch maxSeatNum - yourSeatNum {
+	case 0:
+		return maxSeatNum - 1
+	case 1:
+		return maxSeatNum - 2
+	default:
+		return maxSeatNum
+	}
+}
+
+// GetRightRivalSeatNum returns the seat number of the player sitting to the
+// right of yourSeatNum at a 3-seat table.
+func GetRightRivalSeatNum(yourSeatNum int32, players []*Player) int32 {
+	list := make([]int32, 0, len(players))
+	for _, v := range players {
+		if v != nil {
+			list = append(list, v.SeatNum)
+		}
+	}
+	maxSeatNum := max(list)
+	switch maxSeatNum - yourSeatNum {
+	case 0:
+		return maxSeatNum - 2
+	case 1:
+		return maxSeatNum
+	default:
+		return maxSeatNum - 1
+	}
 }
 
 func max(a []int32) int32 {
-	var m int32
-	m = math.MinInt32
+	m := int32(math.MinInt32)
 	for _, v := range a {
 		if v > m {
 			m = v
@@ -84,26 +87,11 @@ func max(a []int32) int32 {
 }
 
 func min(a []int32) int32 {
-	var m int32
-	m = math.MaxInt32
+	m := int32(math.MaxInt32)
 	for _, v := range a {
 		if v < m {
 			m = v
 		}
 	}
 	return m
-}
-
-//群发的封装
-func WrapMultiSend(players []*Player, ack *proto.JsonACK, cid *proto.ClientID) {
-	var cids []*proto.ClientID
-	for _, v := range players {
-		if cid != nil && v.Cid.ID == cid.ID {
-			continue
-		}
-		if v != nil {
-			cids = append(cids, v.Cid)
-		}
-	}
-	agentapi.MultipleSend(cids, ack)
 }
